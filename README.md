@@ -1,11 +1,13 @@
 # SE-2 — Reconciliation & Settlement Service
 
-**Status: ~20% slice.** File-handling discipline, the transaction lifecycle, fee
-reconciliation, break aging, and the replay-after-fix demo are built. There is no
-service, no API, no dashboard, and no ledger integration.
+**Status: ~55%.** File-handling discipline, the transaction lifecycle, fee
+reconciliation, break aging, the replay-after-fix demo, multi-pass candidate
+matching and the full chargeback lifecycle are built (17 tests). There is still
+no service, no API, no dashboard, and no ledger integration.
 
 ```bash
 python run_settlement.py
+python -m pytest tests -q     # 17 matching + chargeback lifecycle tests
 ```
 
 ## What is built
@@ -75,21 +77,65 @@ silently double-counts, which is the exact failure it is supposed to be immune
 to. `reset_for_replay()` now clears the file ledger so replay runs the *same*
 control path as the original ingest, and the counts tie.
 
-## What is NOT built (the other 80%)
+## Multi-pass matching (`src/matching.py`)
 
-1. **No service.** Library + script only: no API, no scheduler, no daily run
-   automation, no alerting.
-2. **No SE-1 ledger integration.** Chargebacks and settlements post no journal
-   entries. The pairing that makes both projects worth more is not wired.
-3. **Matching is single-pass on exact reference.** No amount+date-window pass,
-   no candidate scoring for residuals — so a settlement row whose reference is
-   mangled is simply unmatched. This is the biggest functional gap.
-4. **Chargeback lifecycle is a state flip.** No dispute record, no evidence
-   deadline countdown, no representment, no write-off flow.
-5. **No dashboard**: file-level received/parsed/rejected view, break queue UI,
-   and the daily rec report exist only as console output.
-6. **Retention/archival** — the "chargeback for an archived transaction" case is
-   named in the spec and not handled here.
-7. **No tests.** This project has none, which is a real gap next to SE-1 and
-   DATA-1; the replay assertion in `run_settlement.py` (states must tie) is the
-   only automated check.
+Exact-reference matching handles the easy 95% and calls the rest "unmatched",
+which pushes the actual work onto a human. Four passes now, each less certain
+than the last and each recording *why* it fired:
+
+| pass | rule | certainty |
+|---|---|---|
+| 1 | exact reference + amount | 1.00 |
+| 2 | reference agrees, amount within tolerance | 0.95 |
+| 3 | no reference — amount + date window + currency, scored | 0.60–0.90 |
+| 4 | residual → break, with the rejected runner-up recorded | — |
+
+Pass 3 is where judgement enters, so the score is **additive and every component
+is stored**. "The system matched it" is not an answer to an auditor; "amount
+agreed exactly (+0.50), settled one business day later (+0.20), currency matched
+(+0.15)" is.
+
+The rule that keeps it honest: **a candidate only wins if it beats the runner-up
+by a margin.** Two plausible candidates mean the evidence does not identify
+either one, and taking the higher score is guessing with extra steps. Ambiguous
+rows go to the break queue for a human —
+`test_ambiguous_candidates_are_refused_not_guessed` pins it.
+
+## Chargeback lifecycle (`src/chargebacks.py`)
+
+A chargeback is not a negative settlement row. It is a dispute with a clock:
+
+```
+received -> evidence_due -> represented -> won | lost
+     |                                       |
+     +-> accepted (a decision) ---------------+
+     +-> expired (an operational failure) ----+
+```
+
+`accepted` and `expired` both end in a loss, and separating them is the point —
+one is a decision, the other is your own process losing money, and a team that
+reports them together can never tell how much the process costs.
+
+Deadlines are **calendar days**, because card network rules count calendar days;
+using business days would silently grant several days that do not exist. Evidence
+submitted after the deadline raises rather than being accepted and quietly lost.
+
+## What is NOT built
+
+1. **No service.** Library + scripts: no API, no scheduler, no daily automation,
+   no alerting.
+2. **No SE-1 ledger integration.** Chargebacks and settlements still post no
+   journal entries. The pairing that makes both projects worth more is the single
+   biggest gap left here.
+3. **Chargeback money movement.** The lifecycle and deadlines are modelled, but
+   winning or losing a dispute posts nothing — see item 2.
+4. **No dashboard**: file-level received/parsed/rejected, break queue, and the
+   daily rec report exist only as console output.
+5. **Retention/archival** — `aged_reference_report()` computes how far back
+   disputes reach (which is what should *drive* retention policy), but no
+   archival tier exists and the "chargeback for an archived transaction" case is
+   still unhandled.
+6. **Representment evidence** is a state, not a document workflow: no evidence
+   templates, no submission integration, no win-rate tracking by reason code.
+7. **Fee variance materiality** is flagged per transaction but not aggregated
+   into a monthly dispute pack with a materiality threshold.

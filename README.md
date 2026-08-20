@@ -1,12 +1,13 @@
 # SE-2 — Reconciliation & Settlement Service
 
-**Status: ~55%.** File-handling discipline, the transaction lifecycle, fee
-reconciliation, break aging, the replay-after-fix demo, multi-pass candidate
-matching and the full chargeback lifecycle are built (17 tests). There is still
-no service, no API, no dashboard, and no ledger integration.
+**Status: ~75%.** File-handling discipline, transaction lifecycle, fee
+reconciliation, break aging, replay-after-fix, multi-pass candidate matching, the
+full chargeback lifecycle, and **double-entry postings into SE-1's ledger** (17
+tests). There is still no service, no API and no dashboard.
 
 ```bash
-python run_settlement.py
+python run_settlement.py      # ingestion, lifecycle, fees, replay-after-fix
+python run_ledger_link.py     # post settlements + chargebacks to SE-1's ledger
 python -m pytest tests -q     # 17 matching + chargeback lifecycle tests
 ```
 
@@ -123,12 +124,11 @@ submitted after the deadline raises rather than being accepted and quietly lost.
 ## What is NOT built
 
 1. **No service.** Library + scripts: no API, no scheduler, no daily automation,
-   no alerting.
-2. **No SE-1 ledger integration.** Chargebacks and settlements still post no
-   journal entries. The pairing that makes both projects worth more is the single
-   biggest gap left here.
-3. **Chargeback money movement.** The lifecycle and deadlines are modelled, but
-   winning or losing a dispute posts nothing — see item 2.
+   no alerting. This is now the biggest gap.
+2. **The ledger link is one-directional.** `run_ledger_link.py` posts settlements
+   and chargebacks into SE-1's journal and proves the books balance and survive
+   replay, but nothing feeds the ledger's view BACK into the break queue -- so a
+   posting failure would not raise a reconciliation break.
 4. **No dashboard**: file-level received/parsed/rejected, break queue, and the
    daily rec report exist only as console output.
 5. **Retention/archival** — `aged_reference_report()` computes how far back

@@ -1,14 +1,16 @@
 # SE-2 — Reconciliation & Settlement Service
 
-**Status: ~75%.** File-handling discipline, transaction lifecycle, fee
+**Status: ~85%.** File-handling discipline, transaction lifecycle, fee
 reconciliation, break aging, replay-after-fix, multi-pass candidate matching, the
-full chargeback lifecycle, and **double-entry postings into SE-1's ledger** (17
-tests). There is still no service, no API and no dashboard.
+full chargeback lifecycle, **double-entry postings into SE-1's ledger**, an HTTP
+API, and a three-tier retention policy validated against observed dispute ages --
+**30 tests**.
 
 ```bash
 python run_settlement.py      # ingestion, lifecycle, fees, replay-after-fix
 python run_ledger_link.py     # post settlements + chargebacks to SE-1's ledger
-python -m pytest tests -q     # 17 matching + chargeback lifecycle tests
+python -m pytest tests -q     # 30 tests
+uvicorn serve:app --port 8200 # daily report, break queue, retention plan
 ```
 
 ## What is built
@@ -123,18 +125,19 @@ submitted after the deadline raises rather than being accepted and quietly lost.
 
 ## What is NOT built
 
-1. **No service.** Library + scripts: no API, no scheduler, no daily automation,
-   no alerting. This is now the biggest gap.
+1. **No scheduler.** `serve.py` exposes the daily report, the break queue,
+   deadlines and the retention plan over HTTP, but nothing runs the daily cycle
+   — file arrival still has to be triggered by hand. This is now the biggest gap.
 2. **The ledger link is one-directional.** `run_ledger_link.py` posts settlements
    and chargebacks into SE-1's journal and proves the books balance and survive
-   replay, but nothing feeds the ledger's view BACK into the break queue -- so a
+   replay, but nothing feeds the ledger's view BACK into the break queue — so a
    posting failure would not raise a reconciliation break.
-4. **No dashboard**: file-level received/parsed/rejected, break queue, and the
-   daily rec report exist only as console output.
-5. **Retention/archival** — `aged_reference_report()` computes how far back
-   disputes reach (which is what should *drive* retention policy), but no
-   archival tier exists and the "chargeback for an archived transaction" case is
-   still unhandled.
+3. **No dashboard.** The API returns the numbers; nothing renders them, and
+   there is no alert rule on aged breaks or fee variance.
+4. **The archive is not populated by the pipeline.** `src/retention.py` tiers,
+   archives, retrieves and purges with a recorded purge log, and the API falls
+   back to it on a lookup miss — but no job moves data from hot storage into it
+   on a schedule, so the tiering is exercised by tests rather than by use.
 6. **Representment evidence** is a state, not a document workflow: no evidence
    templates, no submission integration, no win-rate tracking by reason code.
 7. **Fee variance materiality** is flagged per transaction but not aggregated

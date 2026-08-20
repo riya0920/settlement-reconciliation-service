@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import threading
 from pathlib import Path
 
 from .files import FileRejected, InternalTxn, SettlementRow, expected_fee, parse
@@ -70,8 +71,19 @@ class ConflictingRedelivery(Exception):
 
 class Service:
     def __init__(self, path: str = ":memory:"):
-        self.con = sqlite3.connect(path)
+        # check_same_thread=False because an ASGI server dispatches handlers on
+        # a worker-thread pool while the connection is created during startup.
+        # SQLite itself is safe across threads in serialized mode; what is NOT
+        # safe is two threads interleaving statements on one connection, so
+        # every write goes through `self._lock`.
+        #
+        # A real deployment uses a connection pool per worker and this whole
+        # note disappears. It is here because "works in a script, explodes under
+        # a web server" is a specific and very common way a demo stops being a
+        # service.
+        self.con = sqlite3.connect(path, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self.con.executescript(SCHEMA)
 
     def load_internal(self, txns: list[InternalTxn]) -> None:
@@ -83,6 +95,10 @@ class Service:
 
     # -- ingestion ---------------------------------------------------------
     def ingest(self, path: Path, *, allow_replay: bool = False) -> dict:
+        with self._lock:
+            return self._ingest_locked(path, allow_replay=allow_replay)
+
+    def _ingest_locked(self, path: Path, *, allow_replay: bool = False) -> dict:
         content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
         file_id, rows = parse(path)          # raises FileRejected on bad totals
 

@@ -61,7 +61,10 @@ ACCOUNTS = [
 
 
 class LedgerLink:
+    failures: list
+
     def __init__(self, currency: str = "USD", db_path: str = ":memory:"):
+        self.failures = []
         self.currency = currency
         self.available = False
         self.reason = ""
@@ -130,6 +133,49 @@ class LedgerLink:
         return self._post(entries, reason, "outcome", 0,
                           {"ref": ref, "won": won, "amount": amount})
 
+    # ------------------------------------------------- feedback to the queue
+    def unposted_breaks(self) -> list[dict]:
+        """Posting failures, shaped as reconciliation breaks.
+
+        The link used to be one-directional: settlements went into the journal
+        and nothing came back, so a posting that failed produced no break, no
+        alert and no queue item. This closes the loop -- every failure becomes a
+        `ledger_unposted` break with the file coordinate that produced it, so it
+        ages and escalates like any other.
+        """
+        return [{
+            "ref": f["ref"], "break_type": "ledger_unposted",
+            "detail": "GL posting failed ({}): {}".format(f["reason"], f["error"]),
+            "core_amount": f["amount_minor"], "proc_amount": 0,
+            "file_id": f["file_id"], "line_no": f["line_no"],
+        } for f in self.failures]
+
+    def reconcile_to_ledger(self, expected_minor: int, account: str) -> dict:
+        """Does the GL agree with what settlement thinks it moved?
+
+        A control the one-directional link could not have: the service's own
+        total against the journal's balance. They must agree to the minor unit,
+        and a difference is a break in its own right -- not a rounding note.
+        """
+        if not self.available:
+            return {"status": "no_ledger"}
+        actual = self.ledger.balance(account)
+        diff = actual - expected_minor
+        return {
+            "status": "ok" if diff == 0 else "BREAK",
+            "account": account,
+            "expected_minor": expected_minor,
+            "ledger_minor": actual,
+            "difference_minor": diff,
+            "break": None if diff == 0 else {
+                "ref": "GL:{}".format(account),
+                "break_type": "ledger_divergence",
+                "detail": ("settlement expected {} minor in {}, ledger holds {}"
+                           .format(expected_minor, account, actual)),
+                "core_amount": expected_minor, "proc_amount": actual,
+            },
+        }
+
     def _post(self, entries, reason: str, file_id: str, line_no: int,
               payload: dict) -> int | None:
         # Idempotency key is the file coordinate, so replaying a settlement file
@@ -140,7 +186,19 @@ class LedgerLink:
             body, _status, replayed = self.ledger.post_idempotent(
                 key=key, payload=payload, entries=entries,
                 actor="settlement-service", reason=reason, request_id=key)
-        except Exception:
+        except Exception as exc:                              # noqa: BLE001
+            # A swallowed posting failure is the worst outcome available here.
+            # The settlement service goes on believing the transaction settled,
+            # the general ledger never hears about it, and the two disagree by
+            # exactly that amount forever -- with nothing anywhere pointing at
+            # the row. Returning None quietly, which this did, is how a
+            # reconciliation platform becomes the thing that needs reconciling.
+            self.failures.append({
+                "ref": payload.get("ref", "?"), "file_id": file_id,
+                "line_no": line_no, "reason": reason,
+                "amount_minor": payload.get("amount_minor", 0),
+                "error": "{}: {}".format(type(exc).__name__, exc),
+            })
             return None
         if replayed:
             self.skipped_duplicate += 1

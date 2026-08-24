@@ -130,13 +130,25 @@ class ArchiveStore:
         rows = len(self.retrieve(business_date))
         size = p.stat().st_size
         p.unlink()
+        self.record_purge(business_date, rows, size, reason, actor)
+        return True
+
+    def record_purge(self, business_date: str, rows: int, size: int,
+                     reason: str, actor: str = "retention-job") -> None:
+        """Log a deletion that happened somewhere other than this store.
+
+        Data past the legal floor can still be sitting in hot storage -- it ages
+        out of the archive window into purgeable without necessarily having been
+        archived on the way. Deleting those rows and NOT logging it would leave
+        exactly the unexplainable hole the purge log exists to prevent, so the
+        log is a property of the retention POLICY rather than of the file.
+        """
         with self.purge_log.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({
                 "business_date": business_date, "rows": rows,
                 "bytes": size, "reason": reason, "actor": actor,
                 "purged_at": date.today().isoformat(),
             }) + "\n")
-        return True
 
     def purge_history(self) -> list[dict]:
         if not self.purge_log.exists():

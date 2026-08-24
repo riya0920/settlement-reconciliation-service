@@ -1,17 +1,17 @@
 # SE-2 — Reconciliation & Settlement Service
 
-**Status: ~95%.** File-handling discipline, transaction lifecycle, fee
+**Status: ~97%.** File-handling discipline, transaction lifecycle, fee
 reconciliation, break aging, replay-after-fix, multi-pass candidate matching, the
 full chargeback lifecycle, **double-entry postings into SE-1's ledger with
 feedback into the break queue**, an HTTP API, a three-tier retention policy, and
 a **schedulable daily cycle with catch-up, cutoffs and two independent
-idempotency guards** -- **45 tests**.
+idempotency guards** -- **61 tests**.
 
 ```bash
 python run_settlement.py      # ingestion, lifecycle, fees, replay-after-fix
 python run_cycle.py           # the daily cycle: catch-up, cutoff, idempotency
 python run_ledger_link.py     # post settlements + chargebacks to SE-1's ledger
-python -m pytest tests -q     # 45 tests
+python -m pytest tests -q     # 61 tests
 uvicorn serve:app --port 8200 # daily report, break queue, retention plan
 ```
 
@@ -196,6 +196,53 @@ Two additions close the loop:
   a difference is a `ledger_divergence` break — a control the one-directional
   link could not have had.
 
+## The break queue now consumes the ledger feedback
+
+`unposted_breaks()` and `reconcile_to_ledger()` produced break-shaped records
+and **nothing inserted them anywhere** — the loop was closed in the library and
+open in the pipeline, which is the difference between "we detect posting
+failures" and "somebody is told about them".
+
+`src/break_queue.py` is the persistent queue that ingests them. Two properties
+make a break actionable rather than merely logged:
+
+- **It survives the run.** Aging only means something if the item is still there
+  tomorrow. An in-memory queue is reborn one day old every morning and nothing
+  ever escalates.
+- **`first_seen` never moves.** A break that recurs keeps its original age. If
+  recurrence reset the clock, something unresolved for three weeks would be
+  forever one day old — the commonest way a break queue fails silently.
+
+**Ledger breaks are typed differently and start at T3.** A settlement break is a
+disagreement between two records of one event; a `ledger_unposted` break means
+the service's own view is already wrong and every report built on it is wrong
+too. That does not age into severity — it starts there.
+
+The event trail is append-only, enforced by triggers. An audit trail you can
+edit is application logging with a nicer name.
+
+## The monthly dispute pack
+
+`fee_variance_summary()` flags every transaction whose fee differs from the
+schedule. On a month of real volume that is thousands of rows — and a list of
+thousands of rows is not a dispute, it is a spreadsheet nobody sends.
+
+`src/dispute_pack.py` turns it into one:
+
+- **Grouped by root cause.** The processor does not care that transaction 4471
+  was three cents light; it cares that one fee tier was mis-applied 8,000 times.
+  Grouping is on basis points of gross rounded to the nearest 5bp, because exact
+  equality splits one tier error into dozens of groups on rounding alone — and a
+  test asserts that genuinely scattered variances do *not* collapse, since
+  grouping those would invent a root cause.
+- **A stated materiality threshold**, as a parameter. Below it the variance
+  costs less to absorb than to argue about, and that judgement belongs to
+  finance rather than to a constant buried in a comparison.
+- **Both directions.** Variances in the processor's favour are in the same pack.
+  A pack reporting only what we are owed is a negotiating position dressed as a
+  reconciliation, and the first thing the other side does is find the ones we
+  left out.
+
 ## What is NOT built
 
 1. **A scheduler.** `run_cycle` is the job and something outside still has to
@@ -211,10 +258,10 @@ Two additions close the loop:
    is exercised by tests rather than by use.
 4. **Representment evidence** is a state, not a document workflow: no evidence
    templates, no submission integration, no win-rate tracking by reason code.
-5. **Fee variance materiality** is flagged per transaction and summarised per
-   cycle, but not aggregated into a monthly dispute pack with a materiality
-   threshold and a covering position.
-6. **The break queue does not consume the ledger feedback.** `unposted_breaks()`
-   and `reconcile_to_ledger()` produce break-shaped records; nothing yet inserts
-   them into the persistent queue, so the loop is closed in the library and not
-   in the running pipeline.
+5. **The dispute pack is not generated on a schedule** and has no covering
+   letter or evidence attachments -- it produces the numbers and the root
+   causes, not the document that gets sent.
+6. **The daily cycle does not call the queue.** `break_queue.ingest_ledger_feedback`
+   exists and is tested; `run_cycle` has no step that invokes it, so the loop is
+   closed between the link and the queue and still open between the cycle and
+   both.

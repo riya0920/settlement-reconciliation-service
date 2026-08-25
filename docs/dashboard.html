@@ -1,0 +1,71 @@
+<!doctype html><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Settlement operations</title><style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#666;--line:#e3e3e3;--card:#fafafa;
+--page:#b3261e;--ticket:#a06000;--info:#37618e;--ok:#1e7a3c}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+--bg:#16181c;--fg:#e8e8e8;--muted:#9aa0a6;--line:#2c2f36;--card:#1d2026;
+--page:#f2857c;--ticket:#e3b341;--info:#8ab4f8;--ok:#6dd58c}}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
+font:14px/1.5 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif}
+h1{font-size:20px;margin:0 0 2px}h2{font-size:14px;margin:26px 0 8px;
+text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.sub{color:var(--muted);margin-bottom:20px;font-size:13px}
+.alert{border-left:3px solid var(--line);background:var(--card);
+padding:10px 14px;margin-bottom:8px;border-radius:0 4px 4px 0}
+.alert.page{border-left-color:var(--page)}
+.alert.ticket{border-left-color:var(--ticket)}
+.alert.info{border-left-color:var(--info)}
+.sev{font-weight:600;font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.sev.page{color:var(--page)}.sev.ticket{color:var(--ticket)}.sev.info{color:var(--info)}
+.act{color:var(--muted);font-size:13px;margin-top:3px}
+.clear{color:var(--ok);background:var(--card);padding:10px 14px;border-radius:4px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;
+letter-spacing:.05em}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+.wrap{overflow-x:auto}
+.late{color:var(--page);font-weight:600}
+.foot{margin-top:28px;color:var(--muted);font-size:12px;border-top:1px solid
+var(--line);padding-top:12px}
+</style>
+<h1>Settlement operations</h1>
+<div class='sub'>as of 2026-05-05 &middot; 625 open break(s) &middot; 40 open dispute(s)</div>
+<h2>Needs action</h2>
+<div class='alert page'><span class='sev page'>page</span> &nbsp;625 break(s) at T3 (10+ days)<div class='act'>&rarr; controller review / write-off decision</div></div>
+<div class='alert page'><span class='sev page'>page</span> &nbsp;10 dispute(s) past their evidence deadline<div class='act'>&rarr; already lost -- confirm and record, do not submit</div></div>
+<div class='alert page'><span class='sev page'>page</span> &nbsp;2 dispute(s) with the window closing today<div class='act'>&rarr; submit today or the funds are gone regardless of merit</div></div>
+<div class='alert ticket'><span class='sev ticket'>ticket</span> &nbsp;9 dispute(s) due within 2 days<div class='act'>&rarr; assemble evidence now</div></div>
+<h2>Oldest breaks</h2><div class='wrap'><table>
+<tr><th>ref</th><th>type</th><th class='num'>age</th><th>tier</th><th>action</th></tr>
+<tr><td>AUTH00000005</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000006</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000008</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000009</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000019</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000023</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000029</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000030</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000037</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+<tr><td>AUTH00000044</td><td>pending</td><td class='num'>34</td><td>T3</td><td>controller review / write-off decision</td></tr>
+</table></div>
+<h2>Evidence deadlines</h2><div class='wrap'><table>
+<tr><th>ref</th><th>reason</th><th class='num'>amount</th><th>due</th><th class='num'>days</th><th>worth fighting</th></tr>
+<tr><td>AUTH00000039</td><td>unrecognised</td><td class='num'>310,841</td><td>2026-05-01</td><td class='num late'>-4</td><td>no</td></tr>
+<tr><td>AUTH00000025</td><td>fraud</td><td class='num'>199,975</td><td>2026-05-01</td><td class='num late'>-4</td><td>no</td></tr>
+<tr><td>AUTH00000027</td><td>duplicate_processing</td><td class='num'>215,813</td><td>2026-05-02</td><td class='num late'>-3</td><td>yes</td></tr>
+<tr><td>AUTH00000024</td><td>unrecognised</td><td class='num'>192,056</td><td>2026-05-02</td><td class='num late'>-3</td><td>no</td></tr>
+<tr><td>AUTH00000013</td><td>credit_not_processed</td><td class='num'>104,947</td><td>2026-05-02</td><td class='num late'>-3</td><td>yes</td></tr>
+<tr><td>AUTH00000010</td><td>fraud</td><td class='num'>81,190</td><td>2026-05-02</td><td class='num late'>-3</td><td>no</td></tr>
+<tr><td>AUTH00000026</td><td>product_not_received</td><td class='num'>207,894</td><td>2026-05-03</td><td class='num late'>-2</td><td>yes</td></tr>
+<tr><td>AUTH00000012</td><td>duplicate_processing</td><td class='num'>97,028</td><td>2026-05-03</td><td class='num late'>-2</td><td>yes</td></tr>
+<tr><td>AUTH00000009</td><td>unrecognised</td><td class='num'>73,271</td><td>2026-05-03</td><td class='num late'>-2</td><td>no</td></tr>
+<tr><td>AUTH00000011</td><td>product_not_received</td><td class='num'>89,109</td><td>2026-05-04</td><td class='num late'>-1</td><td>yes</td></tr>
+</table></div>
+<h2>Fee variance</h2><div class='wrap'><table>
+<tr><th>rows</th><th class='num'>total variance (minor)</th><th class='num'>materiality</th><th>state</th></tr>
+<tr><td>0</td><td class='num'>0</td><td class='num'>5,000</td><td>below floor</td></tr>
+</table></div>
+<div class='foot'>Every threshold on this page is imported from the module that owns it &mdash; break tiers from <code>break_queue.TIERS</code>, materiality from <code>dispute_pack</code>, evidence windows from <code>chargebacks</code>. A dashboard with its own copy of the rules is a second implementation of them, and the two drift.</div>

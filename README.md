@@ -250,14 +250,23 @@ thousands of rows is not a dispute, it is a spreadsheet nobody sends.
    the same reason DATA-1 gives: a scheduler embedded in the application is one
    nobody can inspect, pause or back-fill from. But it means nothing here fires
    on its own.
-2. **No dashboard.** The API returns the numbers; nothing renders them, and there
-   is no alert rule on aged breaks or fee variance.
-3. **The archive is still not populated by the pipeline.** `src/retention.py`
-   tiers, archives, retrieves and purges with a recorded purge log, and the cycle
-   has an `archive` step — but the runner passes no archive callable, so tiering
-   is exercised by tests rather than by use.
-4. **Representment evidence** is a state, not a document workflow: no evidence
-   templates, no submission integration, no win-rate tracking by reason code.
+2. ~~**No dashboard.**~~ **DONE** — `src/dashboard.py` renders an operator view
+   served at `/dashboard`, with alert rules on break aging, fee variance and
+   evidence deadlines. Every threshold is IMPORTED from the module that owns it
+   rather than re-typed, so the screen and the system cannot drift apart.
+   `/dashboard.json` exposes the same alerts for scraping, because an alert
+   that only exists on a screen needs somebody to be looking at the screen. See
+   `docs/DASHBOARD.md` and `docs/dashboard.html`.
+3. ~~**The archive is still not populated by the pipeline.**~~ **DONE** —
+   `src/archival_job.py` moves data between tiers with archive-verify-delete
+   ordering, and `run_retention.py` drives 3,300 transactions across eight years
+   through it. See `docs/RETENTION.md`.
+4. ~~**Representment evidence** is a state, not a document workflow~~ — **partly
+   done.** `src/representment.py` assembles evidence from the real tiered store,
+   decides fight-or-fold on expected recovery against the representment fee, and
+   orders the queue by deadline. Still no evidence templates and no submission
+   integration; win rates are `ASSUMED_`, not tracked, because this project has
+   no representment outcomes to fit anything to. See `docs/REPRESENTMENT.md`.
 5. **The dispute pack is not generated on a schedule** and has no covering
    letter or evidence attachments -- it produces the numbers and the root
    causes, not the document that gets sent.

@@ -21,12 +21,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from src.chargebacks import ChargebackBook
+from src.dashboard import build as build_dashboard, render_html
 from src.files import DATA, FileRejected, generate, parse
 from src.retention import ArchiveStore, RetentionPolicy, plan_retention
 from src.service import ConflictingRedelivery, DuplicateFile, Service
@@ -161,6 +163,48 @@ def deadlines(as_of: str = Query("2026-05-05")) -> dict:
         "urgent": sum(1 for r in rows if r["urgency"] == "urgent"),
         "items": rows[:50],
     }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(as_of: str = Query("2026-05-05")) -> str:
+    """The operator view.
+
+    Rendered server-side to a single self-contained file. A settlement
+    dashboard is looked at during an incident, and an incident is exactly when
+    a page that fetches a chart library from the internet does not load.
+    """
+    return render_html(_dashboard_view(as_of))
+
+
+@app.get("/dashboard.json")
+def dashboard_json(as_of: str = Query("2026-05-05")) -> dict:
+    """The same view as data, so the alerts can be scraped rather than read.
+
+    An alert that only exists on a screen requires somebody to be looking at
+    the screen.
+    """
+    view = _dashboard_view(as_of)
+    return {
+        "as_of": view["as_of"],
+        "pages": view["pages"],
+        "alerts": [vars(a) for a in view["alerts"]],
+        "break_count": view["break_count"],
+        "chargeback_count": view["chargeback_count"],
+    }
+
+
+def _dashboard_view(as_of: str) -> dict:
+    svc = _svc()
+    book = _state["book"]
+    rows = book.con.execute(
+        "SELECT ref, reason_code, amount_minor, evidence_due_on, state"
+        " FROM chargeback").fetchall()
+    return build_dashboard(
+        aged_breaks=svc.aged_breaks(as_of),
+        fee_summary=svc.fee_variance_summary(),
+        chargebacks=[dict(r) for r in rows],
+        as_of=as_of,
+        state_counts=svc.state_counts())
 
 
 @app.get("/retention/plan")

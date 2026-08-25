@@ -1,0 +1,311 @@
+"""Which disputes to fight, against the real archive.
+
+    python run_representment.py
+
+`src/chargebacks.py` carries a `WINNABLE` set with a comment saying that knowing
+which disputes to fight "is the difference between a chargeback team and a
+chargeback cost centre". Nothing used it. Every dispute took the same path,
+evidence was never assembled from anywhere, and `submit_evidence` was a state
+transition with no evidence attached.
+
+This runs the decision against the tiered store built by `run_retention.py`, so
+the evidence lookups are real: some disputes resolve out of hot storage, some
+out of the gzipped archive, and some cannot be evidenced at all because the
+retention policy purged the record.
+
+That last group demonstrates the mechanism -- what the fight/fold decision does
+when evidence is gone -- and it is CONSTRUCTED rather than observed. Under this
+retention policy a legitimate dispute can never reach a purged record: the
+longest scheme window is ~540 days and nothing is purge-eligible until 2,555, a
+margin of 2,015 days. The document says so directly rather than leaving a reader
+to infer a loss that cannot occur. What is real is the connection between the
+two policies, and the check that notices if the margin ever closes.
+
+Writes docs/REPRESENTMENT.md.
+"""
+from __future__ import annotations
+
+import shutil
+import sqlite3
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+from src.archival_job import evidence_for, run_archival
+from src.chargebacks import EVIDENCE_WINDOW_DAYS, ChargebackBook, WINNABLE
+from src.representment import (ASSUMED_WIN_RATE, REPRESENTMENT_FEE_MINOR,
+                               STAFF_COST_MINOR, assemble, cost_to_fight,
+                               decide, portfolio, work_queue)
+from src.retention import ArchiveStore, RetentionPolicy
+from src.service import SCHEMA
+
+ARCHIVE_DIR = ROOT / "data" / "representment_archive"
+AS_OF = "2026-08-24"
+PER_DAY = 200
+
+# One date per tier, so every evidence outcome is produced by the real policy
+# rather than by a flag.
+TIERS = [("hot", 5), ("archive", 300), ("cold", 1500), ("purged", 3000)]
+
+
+def _book():
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript(SCHEMA)
+    as_of = date.fromisoformat(AS_OF)
+    dates = {}
+    for tier, age in TIERS:
+        d = (as_of - timedelta(days=age)).isoformat()
+        dates[tier] = d
+        for i in range(PER_DAY):
+            ref = "{}-{:04d}".format(d.replace("-", ""), i)
+            amount = 1_000 + (i * 971) % 600_000
+            con.execute(
+                "INSERT INTO txn (ref, auth_date, amount_minor, currency,"
+                " settled_minor, fee_minor, state) VALUES (?,?,?,?,?,?,?)",
+                (ref, d, amount, "USD", amount, 30, "settled"))
+            con.execute(
+                "INSERT INTO match_event (ref, file_id, line_no, rule,"
+                " from_state, to_state, amount_minor) VALUES (?,?,?,?,?,?,?)",
+                (ref, "STL{}".format(d.replace("-", "")), i, "exact_ref",
+                 "pending", "settled", amount))
+    con.commit()
+    return con, dates
+
+
+REASONS = ["fraud", "product_not_received", "duplicate_processing",
+           "credit_not_processed", "unrecognised"]
+
+
+def main() -> int:
+    if ARCHIVE_DIR.exists():
+        shutil.rmtree(ARCHIVE_DIR)
+    con, dates = _book()
+    store = ArchiveStore(ARCHIVE_DIR)
+
+    # Run the real retention policy. This is what decides which disputes can be
+    # evidenced -- not a flag in this script.
+    run_archival(con, store, AS_OF, RetentionPolicy())
+    run_archival(con, store, AS_OF, RetentionPolicy(), purge=True)
+
+    cb_con = sqlite3.connect(":memory:")
+    cb_con.row_factory = sqlite3.Row
+    book = ChargebackBook(cb_con)
+
+    all_dates = list(dates.values())
+    rows = []
+    for tier, _age in TIERS:
+        d = dates[tier]
+        for i in range(0, 40):
+            ref = "{}-{:04d}".format(d.replace("-", ""), i)
+            reason = REASONS[i % len(REASONS)]
+            amount = 1_000 + (i * 971) % 600_000
+            due = (date.fromisoformat(AS_OF)
+                   + timedelta(days=EVIDENCE_WINDOW_DAYS.get(reason, 10)
+                               - (i % 12))).isoformat()
+            rows.append({"ref": ref, "reason_code": reason,
+                         "amount_minor": amount, "state": "received",
+                         "evidence_due_on": due, "tier_expected": tier})
+
+    lookup = lambda ref, search: evidence_for(con, store, ref, search)
+
+    decisions, detail = [], []
+    for r in rows:
+        ev = assemble(lookup, r["ref"], all_dates)
+        d = decide(r["reason_code"], r["amount_minor"], ev)
+        decisions.append(d)
+        detail.append((r, ev, d))
+
+    p = portfolio(decisions)
+    queue = work_queue(rows, AS_OF)
+
+    L = []
+    add = L.append
+    add("# SE-2 — which disputes to fight, and whether we still can")
+    add("")
+    add("Generated by `run_representment.py` against the tiered store built by")
+    add("`run_retention.py`. The evidence lookups are real: some disputes")
+    add("resolve out of hot storage, some out of the gzipped archive, and some")
+    add("cannot be evidenced at all because the retention policy purged the")
+    add("record.")
+    add("")
+    add("`src/chargebacks.py` carried a `WINNABLE` set with a comment saying")
+    add("that knowing which disputes to fight *is the difference between a")
+    add("chargeback team and a chargeback cost centre*. Nothing used it.")
+    add("")
+
+    add("## 1. Can we evidence it at all?")
+    add("")
+    add("The first question is not *should we fight* but *is the record still")
+    add("retrievable*. A representment without the transaction behind it is")
+    add("auto-lost.")
+    add("")
+    by_tier = {}
+    for r, ev, d in detail:
+        by_tier.setdefault(r["tier_expected"], []).append((ev, d))
+    add("| record age | tier that answered | disputes | evidence | fight | fold | cannot evidence |")
+    add("|---|---|---|---|---|---|---|")
+    for tier, age in TIERS:
+        items = by_tier.get(tier, [])
+        answered = {e.tier or "-" for e, _ in items}
+        add("| {} days ({}) | {} | {} | {} | {} | {} | {} |".format(
+            age, tier, ", ".join(sorted(answered)), len(items),
+            items[0][0].status if items else "-",
+            sum(1 for _, d in items if d.action == "fight"),
+            sum(1 for _, d in items if d.action == "fold"),
+            sum(1 for _, d in items if d.action == "cannot_evidence")))
+    add("")
+    add("The bottom row is a storage decision showing up as a chargeback loss.")
+    add("Those records passed the seven-year legal floor and were purged with")
+    add("the deletion recorded, which is correct policy — and every dispute")
+    add("against them is now unwinnable on the merits of transactions that may")
+    add("well have been perfectly good.")
+    add("")
+    add("**Read the next section before drawing any conclusion from it.**")
+    add("")
+    add("`run_retention.py` frames this from the other end: *a retention window")
+    add("shorter than the observed dispute tail means evidence will be missing")
+    add("when it is needed*. This is the moment it is needed.")
+    add("")
+    pol = RetentionPolicy()
+    longest_window = 540
+    margin = pol.legal_floor_days - longest_window
+    add("### But that row cannot happen under this policy, and saying so matters")
+    add("")
+    add("| | days |")
+    add("|---|---|")
+    add("| longest scheme dispute window (services not rendered) | {} |".format(
+        longest_window))
+    add("| legal retention floor, before anything is purge-eligible | {:,} |".format(
+        pol.legal_floor_days))
+    add("| **margin** | **{:,}** |".format(margin))
+    add("")
+    add("A dispute arrives at most ~{} days after the transaction. Nothing is".format(
+        longest_window))
+    add("purge-eligible until {:,}. **The gap is {:,} days, so a legitimate".format(
+        pol.legal_floor_days, margin))
+    add("dispute can never reach a purged record under this policy** — the row")
+    add("above is a {}-day-old dispute, which the schemes would not accept.".format(
+        TIERS[-1][1]))
+    add("")
+    add("It is constructed that way on purpose, and the construction is")
+    add("declared rather than left for a reader to discover. What the row")
+    add("actually demonstrates is the **mechanism**: what the fight/fold")
+    add("decision does when evidence is gone. That matters because the gap is a")
+    add("property of a correctly-set policy and not a law of nature — set")
+    add("`ARCHIVE_DAYS` from a storage budget instead of from the dispute")
+    add("distribution and the margin closes. `RetentionPolicy.validate_against`")
+    add("is the check that catches it, and `run_retention.py` runs it against a")
+    add("700-day observed tail specifically to show it failing.")
+    add("")
+    add("Presenting these 40 as a real loss would be inventing a finding. The")
+    add("real finding is that the policy has {:,} days of margin and the".format(
+        margin))
+    add("machinery to notice if that ever stops being true.")
+    add("")
+
+    add("## 2. Is it worth fighting?")
+    add("")
+    add("| | minor | |")
+    add("|---|---|---|")
+    add("| representment fee | {:,} | charged **whether you win or lose** |".format(
+        REPRESENTMENT_FEE_MINOR))
+    add("| analyst time | {:,} | |".format(STAFF_COST_MINOR))
+    add("| **cost to fight** | **{:,}** | |".format(cost_to_fight()))
+    add("")
+    add("The fee is the term people leave out, and leaving it out makes every")
+    add("small dispute look worth contesting. On a $20 dispute with a $15 fee")
+    add("and a 40% win rate, fighting has an expected value of **minus $7**.")
+    add("")
+    add("| | disputes | expected recovery | cost to fight | net |")
+    add("|---|---|---|---|---|")
+    add("| fight | {} | {:,} | {:,} | **{:+,}** |".format(
+        p["fight"], p["expected_recovery_minor"], p["cost_to_fight_minor"],
+        p["net_minor"]))
+    add("| fold | {} | — | — | {:,} avoided |".format(
+        p["fold"], p["avoided_by_folding_minor"]))
+    add("| cannot evidence | {} | — | — | — |".format(p["cannot_evidence"]))
+    add("")
+    add("**Folding is reported as a saving, not a loss.** The alternative was")
+    add("paying the fee to lose. A chargeback team measured on win rate alone")
+    add("is rewarded for fighting only the easy ones, and a team measured on")
+    add("recovery alone is rewarded for fighting everything.")
+    add("")
+
+    add("## 3. What order?")
+    add("")
+    add("**By deadline, not by amount.** A $200 dispute due tomorrow outranks a")
+    add("$2,000 one due in three weeks, because the second can still be fought")
+    add("later and the first cannot. Sorting a work queue by value is the")
+    add("intuitive thing and it loses the winnable disputes at the front.")
+    add("")
+    add("Top of the queue as of {}:".format(AS_OF))
+    add("")
+    add("| ref | reason | amount | due | days | winnable code |")
+    add("|---|---|---|---|---|---|")
+    for r in queue[:10]:
+        add("| `{}` | {} | {:,} | {} | {}{} | {} |".format(
+            r["ref"], r["reason_code"], r["amount_minor"],
+            r["evidence_due_on"], r["days_to_deadline"],
+            " **OVERDUE**" if r["overdue"] else "",
+            "yes" if r["winnable_code"] else "no"))
+    add("")
+    overdue = sum(1 for r in queue if r["overdue"])
+    add("{} of {} open disputes are already past their evidence deadline.".format(
+        overdue, len(queue)))
+    add("`ChargebackBook.transition` refuses late evidence outright — missing")
+    add("the window is not a soft failure, the funds are gone regardless of the")
+    add("merits. This queue exists so the work does not arrive late in the")
+    add("first place.")
+    add("")
+
+    add("## 4. What is assumed rather than measured")
+    add("")
+    add("| reason code | assumed win rate | in WINNABLE |")
+    add("|---|---|---|")
+    for code in REASONS:
+        add("| {} | {:.0%} | {} |".format(
+            code, ASSUMED_WIN_RATE[code], "yes" if code in WINNABLE else "no"))
+    add("")
+    add("**These are declared stand-ins, not estimates.** This project has no")
+    add("representment outcomes to fit anything to, and a model fitted to")
+    add("nothing and quoted to three decimal places would be the worst artifact")
+    add("in the repo. They are named `ASSUMED_WIN_RATE` rather than")
+    add("`ESTIMATED_` so nobody quotes them as measurements, and a test asserts")
+    add("the name.")
+    add("")
+    add("Everything downstream inherits that. The net figure in section 2 is")
+    add("arithmetic on an assumption — the *structure* of the decision is what")
+    add("this demonstrates, and the numbers would move with a real book of")
+    add("outcomes.")
+    add("")
+
+    add("## What this still does not do")
+    add("")
+    add("- **No evidence document is produced.** The decision says fight and the")
+    add("  records are retrievable; turning them into the PDF a scheme portal")
+    add("  wants is a format problem this does not solve.")
+    add("- **No pre-arbitration.** Losing a representment is not the end of the")
+    add("  path in the real scheme rules, and the second round has its own")
+    add("  economics and its own deadlines.")
+    add("- **Win rate does not vary by evidence quality beyond a halving.**")
+    add("  Partial evidence halves the assumed rate, which is a placeholder for")
+    add("  a relationship that is genuinely continuous.")
+    add("- **The fee is flat.** Real fees vary by network and by whether the")
+    add("  merchant is in a monitoring programme, and a merchant in one is")
+    add("  exactly the merchant whose fight/fold arithmetic changes most.")
+
+    doc = "\n".join(L)
+    (ROOT / "docs").mkdir(exist_ok=True)
+    (ROOT / "docs" / "REPRESENTMENT.md").write_text(doc, encoding="utf-8")
+    print(doc)
+    print()
+    print("wrote docs/REPRESENTMENT.md")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

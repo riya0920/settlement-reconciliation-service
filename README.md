@@ -245,11 +245,15 @@ thousands of rows is not a dispute, it is a spreadsheet nobody sends.
 
 ## What is NOT built
 
-1. **A scheduler.** `run_cycle` is the job and something outside still has to
-   call it at the cutoff — cron, Airflow, a systemd timer. That is deliberate for
-   the same reason DATA-1 gives: a scheduler embedded in the application is one
-   nobody can inspect, pause or back-fill from. But it means nothing here fires
-   on its own.
+1. ~~**A scheduler.**~~ **DONE** — `ops/install_timers.sh` installs
+   `run_cycle_tick.py` as a real systemd timer firing after the 18:00 cutoff,
+   verified under systemd (`ExecMainStatus=0`). `Persistent=false`, because
+   settlement state is cumulative and catching up is `catch_up()`'s job —
+   oldest-first, and it STOPS at the first failure rather than stepping over it,
+   which a timer firing once per missed window cannot do. Exit 20 means the file
+   had not arrived and it is still inside the window: a wait, not an incident.
+   The scheduler stays OUTSIDE the application, which was the original argument
+   and still holds.
 2. ~~**No dashboard.**~~ **DONE** — `src/dashboard.py` renders an operator view
    served at `/dashboard`, with alert rules on break aging, fee variance and
    evidence deadlines. Every threshold is IMPORTED from the module that owns it
@@ -259,8 +263,13 @@ thousands of rows is not a dispute, it is a spreadsheet nobody sends.
    `docs/DASHBOARD.md` and `docs/dashboard.html`.
 3. ~~**The archive is still not populated by the pipeline.**~~ **DONE** —
    `src/archival_job.py` moves data between tiers with archive-verify-delete
-   ordering, and `run_retention.py` drives 3,300 transactions across eight years
-   through it. See `docs/RETENTION.md`.
+   ordering, `run_retention.py` drives 3,300 transactions across eight years
+   through it, **and `run_cycle_tick.py` now passes the `archive` callable the
+   cycle has always accepted.** The step reported *"skipped: no archive
+   configured"* on every run before — and "skipped" is what a step says both
+   when it is unconfigured and when there was nothing to do, which is exactly
+   the ambiguity that hid this. It never purges: purging is irreversible and
+   does not belong in a job that runs unattended every night.
 4. ~~**Representment evidence** is a state, not a document workflow~~ — **partly
    done.** `src/representment.py` assembles evidence from the real tiered store,
    decides fight-or-fold on expected recovery against the representment fee, and
@@ -270,7 +279,16 @@ thousands of rows is not a dispute, it is a spreadsheet nobody sends.
 5. **The dispute pack is not generated on a schedule** and has no covering
    letter or evidence attachments -- it produces the numbers and the root
    causes, not the document that gets sent.
-6. **The daily cycle does not call the queue.** `break_queue.ingest_ledger_feedback`
+6. ~~**The daily cycle does not call the queue.**~~ **DONE** —
+   `run_cycle_tick.py` supplies the `ledger_link` callable, which posts the
+   day's settled rows and feeds the postings that FAILED into the queue via
+   `ingest_ledger_feedback` — the call that module's own docstring says *"was
+   missing"*, with `unposted_breaks()` returning a list nobody read. A posting
+   failure is deliberately swallowed at the post and surfaced through the queue,
+   because it is a break to learn about rather than an exception to die on.
+   Found by running it: the cycle calls it as `ledger_link(service, date)` and
+   the first version took one argument. Superseded note:
+   `break_queue.ingest_ledger_feedback`
    exists and is tested; `run_cycle` has no step that invokes it, so the loop is
    closed between the link and the queue and still open between the cycle and
    both.

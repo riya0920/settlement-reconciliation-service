@@ -1,294 +1,199 @@
-# SE-2: Reconciliation & Settlement Service
+# Reconciliation & Settlement Service
 
-**Status: ~97%.** File-handling discipline, transaction lifecycle, fee
-reconciliation, break aging, replay-after-fix, multi-pass candidate matching, the
-full chargeback lifecycle, **double-entry postings into SE-1's ledger with
-feedback into the break queue**, an HTTP API, a three-tier retention policy, and
-a **schedulable daily cycle with catch-up, cutoffs and two independent
-idempotency guards** -- **61 tests**.
+## What it is
+
+When a business takes card payments, the money does not arrive right away. A
+card processor sends back **settlement files** a day or two later saying which
+payments were paid, how much, and what fees were taken off.
+
+This service reads those files and checks them against our own record of each
+payment. Anything that does not agree (a missing payment, a wrong fee, a
+chargeback) becomes a **break**: an item a person needs to look at.
+
+It also runs the full daily cycle around that: rejecting bad files, tracking
+chargebacks against their deadlines, posting results into the ledger from our
+sister project [Double-Entry Ledger](https://github.com/riya0920/double-entry-ledger-core), and keeping old data for as long as the law requires.
+
+## What we did
+
+1. **Built file intake with control totals.** Each file ends with a trailer
+   stating the row count and totals. If the rows do not add up, the whole file is
+   rejected and nothing is applied.
+2. **Tracked each payment's lifecycle**: pending, settled, partially settled or
+   disputed, with 1 to 2 day delays and chargebacks up to 30 days old.
+3. **Checked fees** against a fee schedule with a stated tolerance, and aged
+   breaks through escalation tiers (T0 monitor up to T3 write-off review).
+4. **Built replay-after-fix**: fix a rule, replay the archived files, and see
+   what changed.
+5. **Added multi-pass matching** for payments that do not match exactly, with a
+   score and a stored reason for every match.
+6. **Modeled the chargeback lifecycle** with calendar-day deadlines.
+7. **Linked to the Double-Entry Ledger** (double-entry postings), with failed postings fed
+   back into a persistent break queue.
+8. **Built a daily cycle** with catch-up, cutoffs and two idempotency guards
+   (running it twice does no harm), installed as a real systemd timer.
+9. **Added the rest**: a dispute pack for fee errors, an operator dashboard, a
+   three-tier retention job, representment (fighting a chargeback) triage, and an
+   HTTP API.
+
+Work was done in several passes. Later passes closed gaps the earlier README
+listed as open, and running things for real found bugs the tests had missed.
+
+## Results
+
+**File intake**
+
+- 7 of 31 generated files have a bad line and are rejected in full (this rate is
+  set high on purpose to test the path).
+- Same file id, same bytes: skipped as already done. Same file id, **different
+  bytes**: rejected, not merged.
+
+**Lifecycle after one run**
+
+| state | count | share |
+|---|---|---|
+| pending | 4,934 | 41.12% |
+| partially_settled | 269 | 2.24% |
+| settled | 6,745 | 56.21% |
+| disputed | 52 | 0.43% |
+
+**Replay-after-fix (planted fee bug)**
+
+| | with the bug | after replay |
+|---|---|---|
+| fee variances | 8,309 | 160 |
+| total variance | $2,822.11 | $329.41 |
+
+- 8,149 of 8,309 fee breaks resolved just by replaying the archive.
+- Lifecycle counts identical in both runs: replay does not double-count.
+- The 160 left are the wrong fees we planted in the files: real disputes with the
+  processor.
+
+**Retention** (3,300 transactions over eight years, see RETENTION.md)
+
+- Archive pass moved 1,800 rows; hot store went from 3,300 to 1,500 rows.
+- Archive is **15.9x** smaller than the raw data.
+- A second run moved 0 rows (all 6 dates skipped as already archived).
+- Looking up an archived row took 0.037 s, 96x slower than a hot one.
+
+**Chargebacks** (see REPRESENTMENT.md)
+
+- 28 of 160 open disputes were already past their evidence deadline.
+- Retention keeps data 2,015 days longer than the longest dispute window.
+
+**Tests**
+
+- **147 tests**, all passing.
+
+**Bugs found by testing (and fixed)**
+
+- The first replay design skipped duplicate checks, so a resent file was applied
+  twice and the counts silently doubled.
+- The retention job forgot a date once it was archived, so archived data could
+  never be purged.
+- A purgeable date was never archived, so purge had to also reach hot storage
+  (found by two failing tests).
+- The daily cycle passed two arguments to the ledger link, which took one.
+- The cycle never passed the archive step, which reported "skipped" every run.
+- Ledger feedback made breaks that nothing put into the queue.
+
+## Key decisions and why
+
+**The trailer is the contract; a bad file is rejected whole.**
+Applying the good rows of a broken file leaves the books in a state no one can
+explain. All or nothing is easy to reason about and easy to retry.
+
+**Same file id with different content is refused, not guessed.**
+The processor is either correcting or duplicating. The system cannot tell which,
+so it stops and asks a person.
+
+**A fuzzy match only wins if it clearly beats the runner-up.**
+Two close candidates mean the evidence does not pick one. Taking the higher
+score would be guessing, so the row goes to the break queue instead.
+
+**Every match stores its reason.**
+"The system matched it" is not an answer for an auditor. "Amount equal, settled
+one day later, same currency" is.
+
+**"Accepted" and "expired" chargebacks are kept apart.**
+Both lose money, but one is a choice and the other is our own process failing.
+Merging them hides what the process costs.
+
+**Deadlines use calendar days.**
+Card network rules count calendar days. Business days would quietly grant extra
+days that do not exist.
+
+**The cycle runs for a date, catches up oldest first, and stops at a failure.**
+Settlement state builds day on day. Applying a later day before an earlier one
+creates states no real sequence of events could produce.
+
+**Time is an input, and a missing file is logged, not raised.**
+Passing `now` in lets us test Sundays, month ends and late starts. Before the
+18:00 cutoff a missing file is a wait; after it, a failure.
+
+**Two idempotency guards.**
+The cycle's state file can be lost or ignored, so the ingest step refuses
+duplicates on its own too. A scheduler firing twice is just a retry.
+
+**Posting failures become breaks.**
+A swallowed error means settlement and the ledger disagree forever with nothing
+pointing at why. Ledger breaks start at T3, because our own view is already
+wrong.
+
+**A break keeps its first-seen date.**
+If a repeat reset the clock, a three-week-old problem would always look one day
+old and never escalate.
+
+**Archive, check, then delete. Purge is a separate flag.**
+Deleting before the archive is read back risks losing data in a crash. Purging
+cannot be undone, so it never runs by default.
+
+**The dashboard imports its thresholds.**
+If the screen kept its own copy of the rules, the two would drift, and people
+trust the screen.
+
+## Limits
+
+- The dispute pack is not run on a schedule and has no covering letter or
+  attachments. It gives the numbers, not the document.
+- Representment has no evidence templates and no submission integration.
+- Chargeback win rates are assumed, not measured (we have no real outcomes).
+- All files and transactions are generated test data, not a real processor feed.
+- The timer never purges; purging stays a manual step.
+
+## How to run
 
 ```bash
-python run_settlement.py      # ingestion, lifecycle, fees, replay-after-fix
-python run_cycle.py           # the daily cycle: catch-up, cutoff, idempotency
-python run_ledger_link.py     # post settlements + chargebacks to SE-1's ledger
-python -m pytest tests -q     # 61 tests
-uvicorn serve:app --port 8200 # daily report, break queue, retention plan
+pip install -r requirements.txt
+python run_settlement.py       # intake, lifecycle, fees, replay-after-fix
+python run_cycle.py            # daily cycle: catch-up, cutoff, idempotency
+python run_ledger_link.py      # post settlements and chargebacks to the Double-Entry Ledger
+python run_retention.py        # three-tier retention on eight years of data
+python run_representment.py    # which chargebacks to fight, and in what order
+python run_dashboard.py        # render the operator dashboard
+python -m pytest tests -q      # 147 tests
+uvicorn serve:app --port 8200  # API: daily report, break queue, /dashboard
 ```
 
-## What is built
+Full write-ups: [RETENTION](docs/RETENTION.md) ·
+[REPRESENTMENT](docs/REPRESENTMENT.md) · [DASHBOARD](docs/DASHBOARD.md) ·
+[dashboard page](docs/dashboard.html)
 
-**Control-total-gated ingestion** (`src/files.py`). Fixed-width header/detail/
-trailer files; the trailer is the contract. Parsed detail records must tie to the
-declared count, gross total, and fee total or the **whole file is rejected** and
-nothing is applied. 7 of 31 generated files carry a malformed line and are
-rejected in full: that rate is deliberately exaggerated to exercise the path.
-
-**File idempotency, with the hard case handled**:
-
-| Delivery | Behaviour |
-|---|---|
-| same `file_id`, byte-identical | no-op: already ingested |
-| same `file_id`, **different content** | **rejected**, not merged |
-
-The second is the one that matters. A processor re-sending a file with one extra
-line is either correcting or duplicating, and the system must not guess. It
-refuses and asks.
-
-**Transaction lifecycle**, not a diff: `pending → settled / partially_settled /
-disputed`, with T+1/T+2 lag, partial settlements, and chargebacks referencing
-transactions up to 30 days old.
+## Layout
 
 ```
-pending                4,934   41.12%
-partially_settled        269    2.24%
-settled                6,745   56.21%
-disputed                  52    0.43%
+src/files.py          fixed-width file parsing, control totals
+src/service.py        intake, lifecycle, fees, replay
+src/matching.py       four-pass matching with scores
+src/chargebacks.py    chargeback lifecycle and deadlines
+src/ledger_link.py    postings into the Double-Entry Ledger, feedback
+src/break_queue.py    persistent break queue with aging
+src/scheduler.py      daily cycle: catch-up, cutoffs, guards
+src/dispute_pack.py   fee variances grouped by root cause
+src/retention.py      tier policy
+src/archival_job.py   archive, verify, delete, purge
+src/representment.py  fight-or-fold and deadline queue
+src/dashboard.py      operator view and alert rules
+serve.py              HTTP API
+ops/install_timers.sh systemd timer for the daily cycle
 ```
-
-**Provenance on every state change**: `match_event` records ref, file id, line
-number, the rule that fired, and the from/to states.
-
-**Fee reconciliation** against a defined schedule with a stated tolerance, and
-**break aging with escalation tiers** (T0 monitor → T3 write-off review).
-
-## The replay-after-fix demo
-
-A planted bug: the fee expectation drops the fixed $0.30 per-transaction
-component and charges only the bps rate, so nearly every settled row looks like a
-variance. Fix the rule, replay all 31 archived files, diff:
-
-```
-                                with the bug    after replay
-fee variances                          8,309             160
-total variance                     $2,822.11         $329.41
-pending                                4,934           4,934
-partially_settled                        269             269
-settled                                6,745           6,745
-disputed                                  52              52
-
-8,149 of 8,309 fee breaks resolved by replaying the archive.
-Lifecycle states: IDENTICAL across both passes -- replay does not double-count
-```
-
-The 160 survivors are the genuinely mis-deducted fees planted in the files:
-real breaks for a processor dispute, not ours. No file was re-requested from the
-processor; the archive was enough.
-
-**This demo caught a real bug in my own replay design.** The first version kept
-the ingested-file ledger across a replay and passed an `allow_replay` flag that
-skipped duplicate detection. The redelivered file was then applied twice and the
-lifecycle counts did not match the original run: a settlement replay that
-silently double-counts, which is the exact failure it is supposed to be immune
-to. `reset_for_replay()` now clears the file ledger so replay runs the *same*
-control path as the original ingest, and the counts tie.
-
-## Multi-pass matching (`src/matching.py`)
-
-Exact-reference matching handles the easy 95% and calls the rest "unmatched",
-which pushes the actual work onto a human. Four passes now, each less certain
-than the last and each recording *why* it fired:
-
-| pass | rule | certainty |
-|---|---|---|
-| 1 | exact reference + amount | 1.00 |
-| 2 | reference agrees, amount within tolerance | 0.95 |
-| 3 | no reference: amount + date window + currency, scored | 0.60–0.90 |
-| 4 | residual → break, with the rejected runner-up recorded | N/A |
-
-Pass 3 is where judgement enters, so the score is **additive and every component
-is stored**. "The system matched it" is not an answer to an auditor; "amount
-agreed exactly (+0.50), settled one business day later (+0.20), currency matched
-(+0.15)" is.
-
-The rule that keeps it honest: **a candidate only wins if it beats the runner-up
-by a margin.** Two plausible candidates mean the evidence does not identify
-either one, and taking the higher score is guessing with extra steps. Ambiguous
-rows go to the break queue for a human:
-`test_ambiguous_candidates_are_refused_not_guessed` pins it.
-
-## Chargeback lifecycle (`src/chargebacks.py`)
-
-A chargeback is not a negative settlement row. It is a dispute with a clock:
-
-```
-received -> evidence_due -> represented -> won | lost
-     |                                       |
-     +-> accepted (a decision) ---------------+
-     +-> expired (an operational failure) ----+
-```
-
-`accepted` and `expired` both end in a loss, and separating them is the point:
-one is a decision, the other is your own process losing money, and a team that
-reports them together can never tell how much the process costs.
-
-Deadlines are **calendar days**, because card network rules count calendar days;
-using business days would silently grant several days that do not exist. Evidence
-submitted after the deadline raises rather than being accepted and quietly lost.
-
-## The daily cycle
-
-`src/scheduler.py` turns the pipeline into a job something can call at a cutoff.
-Four properties, each earning its place:
-
-**Catch-up, oldest first.** The job runs *for* a business date, not for "today".
-A cycle that only processes today silently drops the day the box was down, and
-nobody finds out until a month-end that does not tie. Settlement state is
-cumulative, so catch-up runs oldest first and **stops at a failure rather than
-stepping over it**: a later day applied before an earlier one transitions a book
-that has not received the earlier day's rows, producing a set of states no
-sequence of events could have created.
-
-**A cutoff, not a clock.** `now` is a parameter. The same absent file gets two
-different verdicts:
-
-```
-2026-04-03  await_file  skipped  file has not arrived; still inside the 18:00 window
-2026-04-03  await_file  failed   file has not arrived and the 18:00 cutoff has passed
-```
-
-A job that raises at 09:00 because the file usually arrives at 10:00 trains its
-operators to close the alert unread. And a job that reads the system clock cannot
-be tested for what it does on a Sunday, at a month end, or when it starts late,
-which are the three cases that break it.
-
-**A missing file is recorded, not raised.** "The file did not arrive" and "the
-job did not run" are the same silence at the time and completely different
-incidents afterwards. The run exists in the log either way, so the difference
-survives.
-
-**Two idempotency guards, because they fail differently.**
-
-```
-GUARD 1 -- the cycle skips what is on record.
-   completed dates re-attempted : 0
-GUARD 2 -- and if something calls it anyway, ingestion refuses.
-   forced re-run of 2026-04-01 -> ingest skipped: already ingested, identical content
-```
-
-The state file is bookkeeping: it can be deleted, restored from a stale backup,
-or simply not consulted by whatever fired the job. File-level idempotency lives
-in the service and holds regardless. This project learned that the expensive way:
-an earlier replay kept the ingested-file ledger and skipped duplicate
-detection, so a redelivered file applied twice and the lifecycle counts silently
-doubled. **A scheduler that fires twice is not an exotic failure; it is a retry.**
-
-One detail worth the line it takes: a byte-identical redelivery is **skipped**,
-not failed. Processors resend files routinely, and an incident raised every time
-one does is an alert that means nothing. Same id with *different* content is a
-different matter and still fails: the processor is either correcting or
-duplicating and the system must not guess.
-
-## The ledger link now points both ways
-
-`_post` swallowed exceptions and returned `None`. That is the worst outcome
-available: the settlement service goes on believing the transaction settled, the
-general ledger never hears about it, and the two disagree by exactly that amount
-forever with nothing anywhere pointing at the row. **A reconciliation platform
-that loses postings silently becomes the thing that needs reconciling.**
-
-Two additions close the loop:
-
-- `unposted_breaks()` turns every posting failure into a `ledger_unposted` break
-  carrying the file coordinate that produced it, so it ages and escalates like
-  any other break rather than vanishing.
-- `reconcile_to_ledger(expected_minor, account)` compares what settlement thinks
-  it moved against what the journal holds. They must agree to the minor unit, and
-  a difference is a `ledger_divergence` break: a control the one-directional
-  link could not have had.
-
-## The break queue now consumes the ledger feedback
-
-`unposted_breaks()` and `reconcile_to_ledger()` produced break-shaped records
-and **nothing inserted them anywhere**: the loop was closed in the library and
-open in the pipeline, which is the difference between "we detect posting
-failures" and "somebody is told about them".
-
-`src/break_queue.py` is the persistent queue that ingests them. Two properties
-make a break actionable rather than merely logged:
-
-- **It survives the run.** Aging only means something if the item is still there
-  tomorrow. An in-memory queue is reborn one day old every morning and nothing
-  ever escalates.
-- **`first_seen` never moves.** A break that recurs keeps its original age. If
-  recurrence reset the clock, something unresolved for three weeks would be
-  forever one day old: the commonest way a break queue fails silently.
-
-**Ledger breaks are typed differently and start at T3.** A settlement break is a
-disagreement between two records of one event; a `ledger_unposted` break means
-the service's own view is already wrong and every report built on it is wrong
-too. That does not age into severity; it starts there.
-
-The event trail is append-only, enforced by triggers. An audit trail you can
-edit is application logging with a nicer name.
-
-## The monthly dispute pack
-
-`fee_variance_summary()` flags every transaction whose fee differs from the
-schedule. On a month of real volume that is thousands of rows, and a list of
-thousands of rows is not a dispute, it is a spreadsheet nobody sends.
-
-`src/dispute_pack.py` turns it into one:
-
-- **Grouped by root cause.** The processor does not care that transaction 4471
-  was three cents light; it cares that one fee tier was mis-applied 8,000 times.
-  Grouping is on basis points of gross rounded to the nearest 5bp, because exact
-  equality splits one tier error into dozens of groups on rounding alone, and a
-  test asserts that genuinely scattered variances do *not* collapse, since
-  grouping those would invent a root cause.
-- **A stated materiality threshold**, as a parameter. Below it the variance
-  costs less to absorb than to argue about, and that judgement belongs to
-  finance rather than to a constant buried in a comparison.
-- **Both directions.** Variances in the processor's favour are in the same pack.
-  A pack reporting only what we are owed is a negotiating position dressed as a
-  reconciliation, and the first thing the other side does is find the ones we
-  left out.
-
-## What is NOT built
-
-1. ~~**A scheduler.**~~ **DONE**: `ops/install_timers.sh` installs
-   `run_cycle_tick.py` as a real systemd timer firing after the 18:00 cutoff,
-   verified under systemd (`ExecMainStatus=0`). `Persistent=false`, because
-   settlement state is cumulative and catching up is `catch_up()`'s job:
-   oldest-first, and it STOPS at the first failure rather than stepping over it,
-   which a timer firing once per missed window cannot do. Exit 20 means the file
-   had not arrived and it is still inside the window: a wait, not an incident.
-   The scheduler stays OUTSIDE the application, which was the original argument
-   and still holds.
-2. ~~**No dashboard.**~~ **DONE**: `src/dashboard.py` renders an operator view
-   served at `/dashboard`, with alert rules on break aging, fee variance and
-   evidence deadlines. Every threshold is IMPORTED from the module that owns it
-   rather than re-typed, so the screen and the system cannot drift apart.
-   `/dashboard.json` exposes the same alerts for scraping, because an alert
-   that only exists on a screen needs somebody to be looking at the screen. See
-   `docs/DASHBOARD.md` and `docs/dashboard.html`.
-3. ~~**The archive is still not populated by the pipeline.**~~ **DONE**:
-   `src/archival_job.py` moves data between tiers with archive-verify-delete
-   ordering, `run_retention.py` drives 3,300 transactions across eight years
-   through it, **and `run_cycle_tick.py` now passes the `archive` callable the
-   cycle has always accepted.** The step reported *"skipped: no archive
-   configured"* on every run before, and "skipped" is what a step says both
-   when it is unconfigured and when there was nothing to do, which is exactly
-   the ambiguity that hid this. It never purges: purging is irreversible and
-   does not belong in a job that runs unattended every night.
-4. ~~**Representment evidence** is a state, not a document workflow~~: **partly
-   done.** `src/representment.py` assembles evidence from the real tiered store,
-   decides fight-or-fold on expected recovery against the representment fee, and
-   orders the queue by deadline. Still no evidence templates and no submission
-   integration; win rates are `ASSUMED_`, not tracked, because this project has
-   no representment outcomes to fit anything to. See `docs/REPRESENTMENT.md`.
-5. **The dispute pack is not generated on a schedule** and has no covering
-   letter or evidence attachments -- it produces the numbers and the root
-   causes, not the document that gets sent.
-6. ~~**The daily cycle does not call the queue.**~~ **DONE**:
-   `run_cycle_tick.py` supplies the `ledger_link` callable, which posts the
-   day's settled rows and feeds the postings that FAILED into the queue via
-   `ingest_ledger_feedback`: the call that module's own docstring says *"was
-   missing"*, with `unposted_breaks()` returning a list nobody read. A posting
-   failure is deliberately swallowed at the post and surfaced through the queue,
-   because it is a break to learn about rather than an exception to die on.
-   Found by running it: the cycle calls it as `ledger_link(service, date)` and
-   the first version took one argument. Superseded note:
-   `break_queue.ingest_ledger_feedback`
-   exists and is tested; `run_cycle` has no step that invokes it, so the loop is
-   closed between the link and the queue and still open between the cycle and
-   both.
